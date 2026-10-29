@@ -222,6 +222,20 @@ pub(super) fn parse_prompt(raw: &str) -> Result<ConsolidationResult, String> {
     validate(prompt_candidate(raw)?, contract)
 }
 
+fn log_failure(reason: &'static str, attempt: usize) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error_key": "memory.consolidation_extraction_failed",
+                "reason": reason,
+                "attempt": attempt,
+            })),
+        "Memory consolidation extraction failed, using history fallback"
+    );
+}
+
 pub(super) async fn extract(
     provider: &dyn ModelProvider,
     model: &str,
@@ -229,7 +243,9 @@ pub(super) async fn extract(
     system_prompt: &str,
     turn: &str,
 ) -> Option<ConsolidationResult> {
-    let contract = contract().ok()?;
+    let contract = contract()
+        .map_err(|()| log_failure("contract_initialization_failed", 0))
+        .ok()?;
     let native = provider.supports_forced_tool_choice(model);
     let tool = ToolSpec::new(
         TOOL_NAME,
@@ -272,17 +288,23 @@ pub(super) async fn extract(
                 ),
             )
             .await
+            .map_err(|_| log_failure("provider_error", attempt + 1))
             .ok()?;
         let result = if native {
             native_candidate(response).and_then(|candidate| validate(candidate, contract))
         } else {
             if !response.tool_calls.is_empty() {
+                log_failure("unexpected_tool_calls", attempt + 1);
                 return None;
             }
-            let text = response
+            let Some(text) = response
                 .text
                 .as_deref()
-                .filter(|text| !text.trim().is_empty())?;
+                .filter(|text| !text.trim().is_empty())
+            else {
+                log_failure("missing_output", attempt + 1);
+                return None;
+            };
             parse_prompt(text)
         };
         match result {
@@ -295,7 +317,10 @@ pub(super) async fn extract(
                     "{turn}\n\nRepair the extraction. Schema keywords and field paths:\n{diagnostics}"
                 ));
             }
-            Err(_) => return None,
+            Err(_) => {
+                log_failure("repair_exhausted", attempt + 1);
+                return None;
+            }
         }
     }
     None

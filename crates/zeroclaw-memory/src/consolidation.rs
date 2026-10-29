@@ -862,7 +862,7 @@ mod tests {
                     .lock()
                     .pop_front()
                     .expect("unexpected extraction call")
-                    .map_err(|_| anyhow::Error::msg("scripted transport failure"))
+                    .map_err(|_| anyhow::Error::msg("private-provider-error-sentinel"))
             }
         }
 
@@ -989,6 +989,90 @@ mod tests {
                 let provider = SequenceProvider::new(vec![reply], false);
                 assert_fallback(&run(&provider).await);
                 assert_eq!(provider.requests.lock().len(), 1);
+            }
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn terminal_extraction_failures_log_bounded_reasons_without_payloads() {
+            let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+            let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+            zeroclaw_log::try_install_capture_subscriber();
+            let mut events = zeroclaw_log::subscribe_or_install();
+            let invalid = r#"{"history_entry":"private-candidate-sentinel","memory_update":"private-candidate-sentinel","private-key-sentinel":true}"#;
+            for (replies, forced, reason, attempt) in [
+                (vec![Err(())], false, "provider_error", 1),
+                (vec![text(None)], false, "missing_output", 1),
+                (vec![text(Some("  "))], false, "missing_output", 1),
+                (
+                    vec![native(vec![call(invalid)])],
+                    false,
+                    "unexpected_tool_calls",
+                    1,
+                ),
+                (
+                    vec![text(Some(invalid)), Err(())],
+                    false,
+                    "provider_error",
+                    2,
+                ),
+                (
+                    vec![text(Some(invalid)), text(Some(invalid))],
+                    false,
+                    "repair_exhausted",
+                    2,
+                ),
+                (
+                    vec![native(vec![call(invalid)]), native(vec![call(invalid)])],
+                    true,
+                    "repair_exhausted",
+                    2,
+                ),
+            ] {
+                let provider = SequenceProvider::new(replies, forced);
+                let memory = zeroclaw_log::scope!(
+                    trace_id: "extraction-failure-regression",
+                    => run(&provider)
+                )
+                .await;
+                assert_fallback(&memory);
+                assert_eq!(provider.requests.lock().len(), attempt);
+                let captured: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                    .filter(|event| {
+                        event["trace_id"] == "extraction-failure-regression"
+                            && event["attributes"]["error_key"]
+                                == "memory.consolidation_extraction_failed"
+                    })
+                    .collect();
+                assert_eq!(captured.len(), 1, "missing or duplicate failure event");
+                let event = &captured[0];
+                assert_eq!(event["severity_text"], "WARN");
+                assert_eq!(event["event"]["action"], "fail");
+                assert_eq!(event["event"]["outcome"], "failure");
+                assert_eq!(event["attributes"]["reason"], reason);
+                assert_eq!(event["attributes"]["attempt"], attempt);
+                let logged = event.to_string();
+                assert!(!logged.contains("sentinel"));
+                assert!(!logged.contains("Discuss deployment"));
+                assert!(!logged.contains("Use staged deployment"));
+            }
+
+            for replies in [
+                vec![text(Some(TYPED_RESPONSE))],
+                vec![text(Some(invalid)), text(Some(TYPED_RESPONSE))],
+            ] {
+                let provider = SequenceProvider::new(replies, false);
+                let memory = zeroclaw_log::scope!(
+                    trace_id: "extraction-success-regression",
+                    => run(&provider)
+                )
+                .await;
+                assert!(memory.writes.lock().len() > 1);
+                assert!(std::iter::from_fn(|| events.try_recv().ok()).all(|event| {
+                    event["trace_id"] != "extraction-success-regression"
+                        || event["attributes"]["error_key"]
+                            != "memory.consolidation_extraction_failed"
+                }));
             }
         }
 
